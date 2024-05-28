@@ -1,0 +1,36 @@
+version: '3.9'
+
+services:
+  socket-app:
+    build: .
+    command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+    ports:
+      - "8000:8000"
+    depends_on: 
+      - redis
+    networks:
+      - app-network
+      - redis
+
+  redis:
+    image: redis:6-alpine
+    container_name: redis_db
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+    networks:
+      - redis
+
+networks:
+  redis:
+    driver: bridge
+  app-network:
+    external: true
+
+
+
+      
