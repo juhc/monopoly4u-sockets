@@ -12,21 +12,20 @@ sio_server = socketio.AsyncServer(
 
 sio_app = socketio.ASGIApp(socketio_server=sio_server, socketio_path="socketio")
 
-GAME_API_HOST = settings.api.GAME_API_HOST
-AUTH_API_HOST = settings.api.AUTH_API_HOST
+GAME_API_URL = settings.api.game_api_url
+AUTH_API_URL = settings.api.auth_api_url
 
 
 @sio_server.event
 async def connect(sid, environ, auth):
+    print("CONNECT")
     if auth["token"]:
+        print(auth)
         async with AsyncClient() as client:
-            print("TEST1")
             response = await client.get(
-                f"http://{AUTH_API_HOST}:8080/api/players/profile",
+                f"{AUTH_API_URL}/api/players/profile",
                 headers={"authorization": auth["token"]},
             )
-            print("TEST2")
-            print(response.json())
             if response.status_code == 200:
                 profile = response.json()
                 user_id = profile.get("id")
@@ -37,9 +36,10 @@ async def connect(sid, environ, auth):
 
 @sio_server.event
 async def disconnect(sid):
-    username = await redis_instance.get(f"session:{sid}:username")
-    user_id = await redis_instance.get(f"session:{sid}:user_id")
-    print(f"SID {sid} - {username} - {user_id} disconnected")
+    await disconnect_game(sid)
+    await redis_instance.delete(f"session:{sid}:username")
+    await redis_instance.delete(f"session:{sid}:user_id")
+    await sio_server.disconnect(sid)
 
 
 @sio_server.event
@@ -48,7 +48,7 @@ async def create_game(sid, players_count):
     user_id = await redis_instance.get(f"session:{sid}:user_id")
     async with AsyncClient() as client:
         response = await client.post(
-            f"http://{GAME_API_HOST}:8081/rooms/",
+            f"{GAME_API_URL}/rooms/",
             data=json.dumps(
                 {
                     "user_id": user_id,
@@ -58,13 +58,15 @@ async def create_game(sid, players_count):
             ),
         )
         if response.status_code == 200:
+            room_id = response.json().get("room_id")
+            await sio_server.enter_room(sid, room=str(room_id))
             await sio_server.emit("add_game", response.json())
 
 
 @sio_server.event
 async def get_games_list(sid):
     async with AsyncClient() as client:
-        response = await client.get(f"http://{GAME_API_HOST}:8081/rooms/")
+        response = await client.get(f"{GAME_API_URL}/rooms/")
         if response.status_code == 200:
             await sio_server.emit("games", data=response.json())
 
@@ -75,11 +77,25 @@ async def join_game(sid, room_id):
         user_id = await redis_instance.get(f"session:{sid}:user_id")
         username = await redis_instance.get(f"session:{sid}:username")
         response = await client.post(
-            f"http://{GAME_API_HOST}:8081/rooms/{room_id}",
+            f"{GAME_API_URL}/rooms/{room_id}",
             data=json.dumps({"user_id": user_id, "username": username}),
         )
         if response.status_code == 200:
+            await sio_server.enter_room(sid, str(room_id))
             await sio_server.emit("add_player", data=response.json())
+
+        response = await client.get(f"{GAME_API_URL}/rooms/{room_id}")
+        if response.status_code == 200:
+            room_info = response.json()
+
+            if len(room_info.get("users")) == room_info.get("players_total"):
+                created_game_response = await client.post(
+                    f"{GAME_API_URL}/rooms/{room_id}/game"
+                )
+                if created_game_response.status_code == 200:
+                    await sio_server.emit(
+                        "room_teleport", data=room_id, room=str(room_id)
+                    )
 
 
 @sio_server.event
@@ -87,23 +103,93 @@ async def disconnect_game(sid):
     async with AsyncClient() as client:
         user_id = await redis_instance.get(f"session:{sid}:user_id")
         response_delete_player = await client.delete(
-            f"http://{GAME_API_HOST}:8081/rooms/players/{user_id}",
+            f"{GAME_API_URL}/rooms/players/{user_id}",
         )
         if response_delete_player.status_code == 200:
             if response_delete_player.json():
                 room_id = response_delete_player.json()["room_id"]
-                room = await client.get(f"http://{GAME_API_HOST}:8081/rooms/{room_id}")
+                room = await client.get(f"{GAME_API_URL}/rooms/{room_id}")
                 if room.status_code == 200:
-                    print("ROOM INFO")
-                    print(room.json())
                     if room.json()["users"] == []:
                         response_delete_room = await client.delete(
-                            f"http://{GAME_API_HOST}:8081/rooms/{room_id}"
+                            f"{GAME_API_URL}/rooms/{room_id}"
                         )
+                        print("CLOSE", room_id)
+                        await sio_server.close_room(room_id)
                         await sio_server.emit(
                             "delete_game", data=response_delete_room.json()
                         )
                     else:
+                        await sio_server.leave_room(sid, room_id)
                         await sio_server.emit(
                             "delete_player", data=response_delete_player.json()
                         )
+
+
+@sio_server.event
+async def get_game_info(sid, room_id):
+    async with AsyncClient() as client:
+        response = await client.get(f"{GAME_API_URL}/rooms/{room_id}/game")
+
+        if response.status_code == 200:
+            await sio_server.emit("get_game_info", data=response.json(), room=sid)
+
+
+@sio_server.event
+async def connect_to_game(sid, room_id):
+    username = await redis_instance.get(f"session:{sid}:username")
+    async with AsyncClient() as client:
+        response = await client.patch(
+            f"{GAME_API_URL}/rooms/{room_id}/game",
+            data=json.dumps({"username": username}),
+        )
+
+        if response.status_code == 200:
+            await sio_server.emit(
+                "player_added", data=response.json(), room=str(room_id)
+            )
+            await sio_server.emit("get_game_info", data=response.json(), room=sid)
+
+            response_room = await client.get(f"{GAME_API_URL}/rooms/{room_id}")
+            response_game = await client.get(f"{GAME_API_URL}/rooms/{room_id}/game")
+
+            if response_room.status_code == 200 and response_game.status_code == 200:
+                if len(response_room.json()["users"]) == len(
+                    response_game.json()["players"]
+                ):
+                    response = await client.post(
+                        f"{GAME_API_URL}/rooms/{room_id}/game/start"
+                    )
+                    if response.status_code == 200:
+                        await sio_server.emit(
+                            "start_game", data=response.json(), room=str(room_id)
+                        )
+
+
+@sio_server.event
+async def make_move(sid, room_id):
+    username = await redis_instance.get(f"session:{sid}:username")
+    async with AsyncClient() as client:
+        response = await client.post(
+            f"{GAME_API_URL}/rooms/{room_id}/game/make-move",
+            data=json.dumps({"username": username}),
+        )
+
+        if response.status_code == 200:
+            await sio_server.emit(
+                "update_game", data=response.json(), room=str(room_id)
+            )
+
+
+@sio_server.event
+async def roll_dice(sid, room_id):
+    username = await redis_instance.get(f"session:{sid}:username")
+    async with AsyncClient() as client:
+        response = await client.post(
+            f"{GAME_API_URL}/rooms/{room_id}/game/roll-dice",
+            data=json.dumps({"username": username}),
+        )
+
+        if response.status_code == 200:
+            await sio_server.emit("dice_info", data=response.json(), room=str(room_id))
+            await make_move(sid, room_id)
